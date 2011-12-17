@@ -74,7 +74,7 @@ func (ts *TwitterStream) error(msg string, err error) {
 	ts.Close()
 }
 
-func (ts *TwitterStream) connect() {
+func (ts *TwitterStream) connect() (myErr *NetError) {
 	var err error
 	log.Println("twitterstream: connecting to", ts.urlStr)
 
@@ -115,17 +115,20 @@ func (ts *TwitterStream) connect() {
 	if u.Scheme == "http" {
 		ts.conn, err = net.Dial("tcp", addr)
 		if err != nil {
-			ts.error("dial failed ", err)
+			myErr = &NetError{"connect: dial failed", true, err}
+			ts.error(myErr.text, err)
 			return
 		}
 	} else {
 		ts.conn, err = tls.Dial("tcp", addr, nil)
 		if err != nil {
-			ts.error("dial failed ", err)
+			myErr = &NetError{"connect: dial failed", true, err}
+			ts.error(myErr.text, err)
 			return
 		}
 		if err = ts.conn.(*tls.Conn).VerifyHostname(addr[:strings.LastIndex(addr, ":")]); err != nil {
-			ts.error("could not verify host", err)
+			myErr = &NetError{"connect: could not verify host", true, err}
+			ts.error(myErr.text, err)
 			return
 		}
 	}
@@ -134,32 +137,37 @@ func (ts *TwitterStream) connect() {
 	// to the response every 30 seconds.
 	err = ts.conn.SetReadTimeout(int64(60 * time.Second))
 	if err != nil {
-		ts.error("set read timeout failed", err)
+		myErr = &NetError{"connect: set read timeout failed", true, err}
+		ts.error(myErr.text, err)
 		return
 	}
 
 	if _, err := ts.conn.Write(request.Bytes()); err != nil {
-		ts.error("error writing request: ", err)
+		myErr = &NetError{"connect: error writing request", true, err}
+		ts.error(myErr.text, err)
 		return
 	}
 
 	ts.r, _ = bufio.NewReaderSize(ts.conn, 8192)
 	p, err := ts.r.ReadSlice('\n')
 	if err != nil {
-		ts.error("error reading response: ", err)
+		myErr = &NetError{"connect: error reading response", true, err}
+		ts.error(myErr.text, err)
 		return
 	}
 
 	m := responseLineRegexp.FindSubmatch(p)
 	if m == nil {
-		ts.error("bad response line", nil)
+		myErr = &NetError{"connect: bad response line", true, nil}
+		ts.error(myErr.text, err)
 		return
 	}
 
 	for {
 		p, err = ts.r.ReadSlice('\n')
 		if err != nil {
-			ts.error("error reading header: ", err)
+			myErr = &NetError{"connect: error reading header", true, err}
+			ts.error(myErr.text, err)
 			return
 		}
 		if len(p) <= 2 {
@@ -170,18 +178,27 @@ func (ts *TwitterStream) connect() {
 	if string(m[1]) != "200" {
 		p, _ := ioutil.ReadAll(ts.r)
 		log.Println(string(p))
-		ts.error("bad response code: "+string(m[1]), nil)
+		switch string(m[1]) {
+		case "401", "403":
+			myErr = &NetError{"connect: bad response code " + string(m[1]), false, nil}
+		default:
+			myErr = &NetError{"connect: bad response code " + string(m[1]), true, nil}
+		}
+		ts.error(myErr.text, err)
 		return
 	}
 
 	ts.chunkState = stateStart
 
 	log.Println("twitterstream: connected to", ts.urlStr)
+	return
 }
 
 // Next returns the next line from the stream. The returned slice is
-// overwritten by the next call to Next.
-func (ts *TwitterStream) Next() []byte {
+// overwritten by the next call to Next. If an error is returned (only
+// NetError at the moment), an unrecoverable situation occurred, like
+// an authentication error.
+func (ts *TwitterStream) Next() ([]byte, error) {
 	for {
 		if ts.r == nil {
 			d := ts.waitUntil.Sub(time.Now())
@@ -189,13 +206,15 @@ func (ts *TwitterStream) Next() []byte {
 				time.Sleep(d)
 			}
 			ts.waitUntil = time.Now().Add(30 * time.Second)
-			ts.connect()
+			if err := ts.connect(); err != nil && !err.Retry {
+				return nil, err
+			}
 			continue
 		}
 
 		p, err := ts.r.ReadSlice('\n')
 		if err != nil {
-			ts.error("error reading line", err)
+			ts.error("next: error reading line", err)
 			continue
 		}
 
@@ -204,9 +223,9 @@ func (ts *TwitterStream) Next() []byte {
 			ts.chunkRemaining, err = strconv.ParseInt(string(p[:len(p)-2]), 16, 64)
 			switch {
 			case err != nil:
-				ts.error("error parsing chunk size", err)
+				ts.error("next: error parsing chunk size", err)
 			case ts.chunkRemaining == 0:
-				ts.error("end of chunked stream", nil)
+				ts.error("next: end of chunked stream", nil)
 			}
 			ts.chunkState = stateNormal
 			continue
@@ -224,8 +243,28 @@ func (ts *TwitterStream) Next() []byte {
 			continue // ignore keepalive line
 		}
 
-		return p
+		return p, nil
 	}
 	panic("should not get here")
-	return nil
+	return nil, nil
+}
+
+// Represents a network error. If Retry is false, then there's no reason to
+// expect that making the request again should succeed (for example,
+// authentication errors).
+type NetError struct {
+	text  string
+	Retry bool
+	Err   error
+}
+
+func (e *NetError) Error() string {
+	msg := e.text
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	if e.Retry {
+		return "connect: " + msg
+	}
+	return "connect (fatal): " + msg
 }
