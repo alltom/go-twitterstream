@@ -122,6 +122,7 @@ func (ts *TwitterStream) connect() (myErr *NetError) {
 	} else {
 		ts.conn, err = tls.Dial("tcp", addr, nil)
 		if err != nil {
+			ts.conn = nil
 			myErr = &NetError{"connect: dial failed", true, err}
 			ts.error(myErr.text, err)
 			return
